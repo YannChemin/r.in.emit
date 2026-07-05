@@ -539,15 +539,19 @@ def main():
 
     gs.message(f"Downloaded/available: {len(downloaded)} of {len(targets)} granule(s).")
 
-    # --- Target project/mapset for import ----------------------------------
+    if not do_import:
+        gs.message(
+            "Done (download only). Use -i to also import via i.hyper.import."
+        )
+        return 0
+
+    # --- Target project/mapset for import -----------------------------
+    # Only resolved (and a new project only created) once we know there is
+    # actually something to import into it -- a download-only run has
+    # nothing to write to a project regardless of project=, so creating
+    # one then would just leave a pointless empty location behind.
     env, gisrc = resolve_target_environment(project, dbase, epsg)
     try:
-        if not do_import:
-            gs.message(
-                "Done (download only). Use -i to also import via i.hyper.import."
-            )
-            return 0
-
         gs.message("Importing granules via i.hyper.import…")
         imported = []  # (map_name, acq_time)
         for map_name, nc_path, acq_time in downloaded:
