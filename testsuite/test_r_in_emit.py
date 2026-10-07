@@ -4,6 +4,7 @@
 # Searches/downloads: Small area over Plumergat (56400), France
 
 import os
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -24,9 +25,18 @@ def _find_token():
     if token:
         return token
     token_file = Path(os.environ.get("EMIT_TEST_TOKEN_FILE", "")).expanduser()
-    if str(token_file) and token_file.exists():
+    if token_file.is_file():
         return token_file.read_text().strip()
     return ""
+
+
+def gs_read(module, **kwargs):
+    """Run a module and return its stdout and stderr combined, since
+    r.in.emit reports the searched collections as messages."""
+    import grass.script as gs
+
+    proc = gs.start_command(module, stdout=gs.PIPE, stderr=subprocess.STDOUT, **kwargs)
+    return proc.communicate()[0]
 
 
 HAS_TOKEN = bool(_find_token())
@@ -59,26 +69,47 @@ class TestRInEmitSearch(TestCase):
 
     def test_print_bbox(self):
         """-p resolves and prints the search bounding box without downloading."""
-        module = self.runModule("r.in.emit", start="2024-01-01", end="2024-01-31", flags="p")
-        self.assertEqual(module.returncode, 0)
+        self.assertModule("r.in.emit", start="2024-01-01", end="2024-01-31", flags="p")
 
     def test_list_granules(self):
         """-l queries NASA CMR and lists granules without downloading."""
         # A wide date range over a small area that has repeat EMIT coverage;
         # tolerate zero results (coverage is not guaranteed for every area/
         # period) as long as the module runs and exits cleanly.
-        module = self.runModule(
-            "r.in.emit", start="2022-01-01", end="2025-12-31", flags="l"
+        self.assertModule("r.in.emit", start="2022-01-01", end="2025-12-31", flags="l")
+
+    def test_list_gas_and_radiance(self):
+        """-m -c -r -l query the L1B radiance and L2B gas collections."""
+        out = gs_read("r.in.emit", start="2023-01-01", end="2023-12-31", flags="mcrl")
+        # Every searched collection is reported, even with zero matches.
+        for short_name in (
+            "EMITL1BRAD",
+            "EMITL2BCH4ENH",
+            "EMITL2BCH4PLM",
+            "EMITL2BCO2ENH",
+            "EMITL2BCO2PLM",
+        ):
+            self.assertIn(short_name, out)
+
+    def test_radiance_import_refused(self):
+        """-r with -i fails before downloading anything when the installed
+        i.hyper.import cannot import L1B radiance (no -r flag)."""
+        out = subprocess.run(
+            ["i.hyper.import", "--interface-description"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        if '<flag name="r">' in out:
+            self.skipTest("installed i.hyper.import imports L1B radiance")
+        self.assertModuleFail(
+            "r.in.emit", start="2024-01-01", end="2024-01-31", flags="ri"
         )
-        self.assertEqual(module.returncode, 0)
 
     def test_bbox_matches_region(self):
         """The bounding box printed by -p reflects the region just set."""
-        import grass.script as gs
-
-        out = gs.read_command(
-            "r.in.emit", start="2024-01-01", end="2024-01-31", flags="p"
-        )
+        # -p reports through gs.message(), i.e. on stderr.
+        out = gs_read("r.in.emit", start="2024-01-01", end="2024-01-31", flags="p")
         self.assertIn("west=", out)
         self.assertIn("north=", out)
         # Rough sanity check: printed west/east should bracket Plumergat's
@@ -156,7 +187,9 @@ class TestRInEmitDownload(TestCase):
         for f in nc_files:
             self.assertGreater(f.stat().st_size, 0, f"{f} is empty")
 
-    @unittest.skipUnless(HAS_NETCDF4, "netCDF4 not installed (needed by i.hyper.import)")
+    @unittest.skipUnless(
+        HAS_NETCDF4, "netCDF4 not installed (needed by i.hyper.import)"
+    )
     def test_download_and_import(self):
         """-i imports a downloaded granule as a raster_3d cube with a timestamp."""
         import grass.script as gs

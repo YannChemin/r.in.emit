@@ -8,6 +8,10 @@ matching granules straight from **LP DAAC** (no STAC cube service is
 involved — EMIT granules are downloaded whole, as delivered, not cropped
 to the region like *r.in.sentinel*'s `cubo`-based Sentinel-2 cubes).
 
+Instead of reflectance, it can also fetch EMIT L1B at-sensor radiance
+(**-r**) and the EMIT L2B greenhouse gas products for methane (**-m**)
+and carbon dioxide (**-c**).
+
 Requires a free
 [NASA Earthdata](https://urs.earthdata.nasa.gov) account and a Bearer
 token (Earthdata login → *User Profile* → *Generate Token*).
@@ -59,6 +63,71 @@ projected. This is true regardless of **project=**: the *search* area
 always comes from the calling session's own region, only the *output*
 location differs.
 
+### Greenhouse gas products (-m, -c)
+
+**-m** (methane, CH4) and **-c** (carbon dioxide, CO2) switch the module
+from reflectance to the EMIT L2B greenhouse gas collections. Both flags
+can be given together. **gas_products=** selects which products are
+fetched for each gas (both by default):
+
+- **enhancement**: one granule per scene (`EMITL2BCH4ENH`,
+  `EMITL2BCO2ENH`), holding three single-band GeoTIFFs: the enhancement
+  itself (`ENH`, in ppm m), its sensitivity (`SENS`) and its uncertainty
+  (`UNCERT`).
+- **plumes**: one granule per detected plume complex (`EMITL2BCH4PLM`,
+  `EMITL2BCO2PLM`), holding a single-band GeoTIFF of the plume and a
+  GeoJSON outline (`PLMMETA`) carrying the plume attributes (plume ID,
+  maximum concentration and its location, and the emission rate
+  estimate with its uncertainty when one was made).
+
+**short_name=** is ignored with **-m**/**-c**. Gas files are small
+(a few tens of MB per enhancement scene, tens of kB per plume) compared
+with reflectance granules.
+
+**clouds=** filters enhancement scenes only. A plume complex exists only
+where the retrieval already found enough clear pixels to detect it, and
+its CMR cloud cover describes the whole scene rather than the plume.
+
+With **-i**, every GeoTIFF is imported with *r.import* as an ordinary 2D
+raster map, not a raster_3d cube, since each holds a single band.
+Enhancement layers span the whole ~75 km swath and are cropped to the
+current region (`extent=region`); plume rasters are kept whole so that
+no plume is cut at the region edge. Each plume outline is imported with
+*v.import* as a vector map, with the plume attributes in its attribute
+table. Rasters get their acquisition time with *r.timestamp* and plume
+vectors with *v.timestamp*. Map names are
+`{output}_{layer}_{acquisition timestamp}`, where the layer is `ch4enh`,
+`ch4sens`, `ch4uncert` or `ch4plm` (`co2...` for carbon dioxide). Plume
+maps also end with the plume ID, since one overpass can detect several
+plumes, e.g. `uae_ch4plm_20240825T064423_003501`; a plume's raster and
+vector maps share the same name.
+
+With **strds=**, one space-time raster dataset (strds) is created per
+imported layer, named `{strds}_{layer}`, e.g. `uae_ch4enh` and
+`uae_ch4plm`.
+
+### L1B radiance (-r)
+
+**-r** downloads EMIT L1B at-sensor radiance (`EMITL1BRAD`) instead of
+reflectance, for processing that starts from radiance, such as methane
+matched-filter retrievals with *i.hyper.methane*. Each granule holds two
+NetCDF files, both downloaded: the radiance (`RAD`) and the observation
+geometry (`OBS`: solar and view angles and path length). **-r** can be
+combined with **-m**/**-c** in the same run.
+
+As for reflectance, only the newest collection version of each
+acquisition is downloaded (see *Collection versions* below).
+
+With **-i**, each radiance file is imported as a raster_3d cube by
+*i.hyper.import* with its **-r** flag, which reads only the part of the
+swath covering the current region (a full L1B scene needs more than
+11 GB of memory to import). Map names are `{output}_rad_{acquisition
+timestamp}`, and **strds=** creates a str3ds named `{strds}_rad`. The OBS
+file is downloaded but not imported. This needs an *i.hyper.import* whose
+EMIT reader imports L1B radiance and has the **-r** flag; with an older
+one, **-r** together with **-i** stops with an error before any download
+starts.
+
 ## NOTES
 
 ### Full-granule downloads, not cropped cubes
@@ -79,6 +148,23 @@ are *not* re-downloaded on a later run unless `--overwrite` is given —
 EMIT granules are large enough that a persistent, skip-if-present local
 cache matters far more here than for Sentinel-2 tiles.
 
+### Collection versions
+
+EMIT L1B radiance and L2A reflectance are being reprocessed from
+collection version V001 to V002, and CMR returns both versions of an
+acquisition when both exist (V002 granule names also drop the orbit and
+scene suffix, e.g. `EMIT_L2A_RFL_002_20230403T143443` next to
+`EMIT_L2A_RFL_001_20230403T143443_2309310_003`). Only the newest version
+of each acquisition is listed and downloaded, for reflectance, radiance
+and gas enhancement scenes alike. Without this, the same multi-GB scene
+was downloaded twice and both copies got the same map name, so only one
+of them was imported. Plume complexes are not filtered by version, since
+several plumes share one acquisition time.
+
+The version filter runs before **clouds=**: the versions of one
+acquisition report different cloud cover (0 % for V002 and 15 % for V001
+on 2023-04-03 over Ninove, Belgium), and the newest is the reference.
+
 ### Cloud filtering
 
 **clouds=** filters by each granule's CMR-reported scene cloud-cover
@@ -97,8 +183,9 @@ periodically.
 
 ### Importing with i.hyper.import (-i)
 
-**-i** runs [i.hyper.import](i.hyper.import.md) (`product=emit`) on every
-downloaded granule, producing one raster_3d hyperspectral cube per
+For reflectance, **-i** runs [i.hyper.import](i.hyper.import.md)
+(`product=emit`) on every downloaded granule (gas products are imported
+differently, see above), producing one raster_3d hyperspectral cube per
 granule in the target project. **composites=**, **composites_custom=**,
 **strength=**, and **-n** are simply forwarded to *i.hyper.import* and
 only take effect together with **-i**. A granule already imported (a
@@ -178,6 +265,43 @@ r.in.emit start=2024-01-01 end=2024-12-31 output=dubai \
   -i project=emit_dubai_new dbase=$HOME/grassdata
 ```
 
+### List methane products and L1B radiance over a site
+
+```sh
+g.region n=25.34 s=25.30 e=55.72 w=55.65
+r.in.emit start=2024-08-20 end=2024-08-31 -m -r -l
+```
+
+```text
+Available granules:
+2024-08-25T06:44:23+00:00  EMITL1BRAD  cloud_cover=46%  EMIT_L1B_RAD_001_20240825T064423_2423804_027  (2 files)
+2024-08-25T06:44:23+00:00  EMITL2BCH4ENH  cloud_cover=46%  EMIT_L2B_CH4ENH_002_20240825T064423_2423804_027  (3 files)
+2024-08-25T06:44:23+00:00  EMITL2BCH4PLM  cloud_cover=0%  EMIT_L2B_CH4PLM_002_20240825T064423_003501  (2 files)
+```
+
+### Download and import methane enhancement and plumes
+
+```sh
+g.region n=25.34 s=25.30 e=55.72 w=55.65
+r.in.emit start=2024-08-25 end=2024-08-25 output=uae -m -i strds=uae
+g.list type=raster,vector pattern="uae_*"
+v.db.select map=uae_ch4plm_20240825T064423_003501
+```
+
+### Download only the detected plume complexes for methane and CO2
+
+```sh
+r.in.emit start=2023-01-01 end=2024-12-31 output=uae -m -c \
+  gas_products=plumes -i
+```
+
+### Download and import L1B radiance for i.hyper.methane
+
+```sh
+g.region n=25.36 s=25.26 e=55.75 w=55.60
+r.in.emit start=2024-08-25 end=2024-08-25 output=uae -r -i
+```
+
 ### Print the resolved search bounding box only
 
 ```sh
@@ -187,10 +311,12 @@ r.in.emit start=2024-01-01 end=2024-12-31 -p
 
 ## SEE ALSO
 
-*[i.hyper.import](i.hyper.import.md), [r.in.sentinel](r.in.sentinel.md),
-[r3.timestamp](r3.timestamp.md), [t.create](t.create.md),
-[t.register](t.register.md), [g.region](g.region.md),
-[g.proj](g.proj.md)*
+*[g.proj](g.proj.md), [g.region](g.region.md),
+[i.hyper.import](i.hyper.import.md), [i.hyper.methane](i.hyper.methane.md),
+[r.import](r.import.md), [r.in.sentinel](r.in.sentinel.md),
+[r.timestamp](r.timestamp.md), [r3.timestamp](r3.timestamp.md),
+[t.create](t.create.md), [t.register](t.register.md),
+[v.import](v.import.md), [v.timestamp](v.timestamp.md)*
 
 ## REFERENCES
 
@@ -199,6 +325,14 @@ r.in.emit start=2024-01-01 end=2024-12-31 -p
 - [EMIT project site (JPL)](https://earth.jpl.nasa.gov/emit/)
 - [NASA CMR API documentation](https://cmr.earthdata.nasa.gov/search/site/docs/search/api.html)
 - [LP DAAC EMIT L2A RFL product page](https://lpdaac.usgs.gov/products/emitl2arflv001/)
+- Thorpe, A.K. et al. (2023). *Attribution of individual methane and
+  carbon dioxide emission sources using EMIT observations from space.*
+  Science Advances 9. [doi:10.1126/sciadv.adh2391](https://doi.org/10.1126/sciadv.adh2391)
+- EMIT L2B product DOIs:
+  [CH4 enhancement](https://doi.org/10.5067/EMIT/EMITL2BCH4ENH.002),
+  [CH4 plume complexes](https://doi.org/10.5067/EMIT/EMITL2BCH4PLM.002),
+  [CO2 enhancement](https://doi.org/10.5067/EMIT/EMITL2BCO2ENH.002),
+  [CO2 plume complexes](https://doi.org/10.5067/EMIT/EMITL2BCO2PLM.002)
 
 ## AUTHOR
 

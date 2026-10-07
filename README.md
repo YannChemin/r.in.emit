@@ -7,6 +7,11 @@ brand new GRASS project — and optionally imports each granule as a
 raster_3d hyperspectral cube via
 [i.hyper.import](https://github.com/YannChemin/i.hyper.import).
 
+It can also fetch EMIT L1B at-sensor radiance (`-r`, e.g. as input for
+[i.hyper.methane](https://github.com/YannChemin/i.hyper.methane)) and the
+EMIT L2B greenhouse gas products for methane (`-m`) and carbon dioxide
+(`-c`), imported as plain 2D rasters and plume outline vector maps.
+
 ```
 g.region n=25.34 s=25.30 e=55.72 w=55.65
 
@@ -65,6 +70,39 @@ one **str3ds** (`t.create type=str3ds` + `t.register type=raster_3d`) —
 the raster_3d equivalent of a STRDS, ready for `t.rast3d.list` and
 temporal-3D algebra.
 
+### Greenhouse gas products (`-m`, `-c`)
+
+`-m` (CH4) and `-c` (CO2) search the EMIT L2B gas collections instead of
+reflectance; `gas_products=` picks what is fetched for each gas (both by
+default):
+
+- `enhancement`: one granule per scene with three single-band GeoTIFFs,
+  the enhancement (`ENH`, ppm m), sensitivity (`SENS`) and uncertainty
+  (`UNCERT`);
+- `plumes`: one granule per detected plume complex, a single-band
+  GeoTIFF plus a GeoJSON outline with the plume attributes (`PLMMETA`).
+
+With `-i` each GeoTIFF becomes an ordinary 2D raster (`r.import`,
+enhancement layers cropped to the region, plumes kept whole) and each
+plume outline a vector map with an attribute table (`v.import`), all
+timestamped. Names are `{output}_{layer}_{timestamp}` (layer `ch4enh`,
+`ch4sens`, `ch4uncert`, `ch4plm`, or `co2...`), plume maps ending with the
+plume ID. `strds=` creates one strds per layer, `{strds}_{layer}`.
+`clouds=` applies to enhancement scenes, not to plume detections.
+
+```
+r.in.emit start=2024-08-25 end=2024-08-25 output=uae -m -i strds=uae
+```
+
+### L1B radiance (`-r`)
+
+`-r` downloads EMIT L1B radiance (`RAD`) and observation geometry (`OBS`)
+NetCDF files. As for reflectance, only the newest collection version
+(V001/V002) of each acquisition is kept. With `-i` the radiance file is imported as a raster_3d
+cube cropped to the region (`i.hyper.import -r`, which needs an
+i.hyper.import that imports L1B radiance); the OBS file is downloaded
+only. It combines with `-m`/`-c`.
+
 ### Other flags
 
 - **`-l`** — list matching granules (timestamp, cloud cover, filename)
@@ -82,9 +120,13 @@ temporal-3D algebra.
 | `output_dir` | Local download cache (default `$HOME/RSDATA/EMIT_<output>`) |
 | `token` | Earthdata Bearer token |
 | `composites`, `composites_custom`, `strength` | Forwarded to `i.hyper.import` (needs `-i`) |
-| `strds` | Name for a str3ds time series (needs `-i`) |
+| `strds` | Name for a str3ds time series, or one strds per gas layer with `-m`/`-c` (needs `-i`) |
+| `gas_products` | `enhancement`, `plumes` or both (default), with `-m`/`-c` |
 | `project`, `dbase`, `epsg` | Create/reuse a separate GRASS project instead of the current one |
-| `-i` | Import via `i.hyper.import` |
+| `-i` | Import (reflectance via `i.hyper.import`; gas products via `r.import`/`v.import`) |
+| `-r` | Download L1B radiance and observation geometry |
+| `-m` | Download L2B methane products |
+| `-c` | Download L2B carbon dioxide products |
 | `-n` | Forwarded to `i.hyper.import -n` |
 | `-l` | List granules and exit |
 | `-p` | Print search bounding box and exit |
@@ -130,6 +172,9 @@ Public domain — see [LICENSE](LICENSE) (Unlicense).
 - [EMIT project site (JPL)](https://earth.jpl.nasa.gov/emit/)
 - [NASA CMR API documentation](https://cmr.earthdata.nasa.gov/search/site/docs/search/api.html)
 - [LP DAAC EMIT L2A RFL product page](https://lpdaac.usgs.gov/products/emitl2arflv001/)
+- Thorpe, A.K. et al. (2023). *Attribution of individual methane and
+  carbon dioxide emission sources using EMIT observations from space.*
+  Science Advances 9. [doi:10.1126/sciadv.adh2391](https://doi.org/10.1126/sciadv.adh2391)
 
 ## See also
 
@@ -140,3 +185,5 @@ Public domain — see [LICENSE](LICENSE) (Unlicense).
 - [i.hyper.endmembers](https://github.com/YannChemin/i.hyper.endmembers),
   [i.hyper.speclookup](https://github.com/YannChemin/i.hyper.speclookup) —
   natural next steps once EMIT cubes are imported
+- [i.hyper.methane](https://github.com/YannChemin/i.hyper.methane) —
+  methane matched filter, fed by L1B radiance from `-r`

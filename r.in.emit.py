@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # %Module
-# % description: Downloads NASA EMIT L2A Surface Reflectance granules via NASA CMR/LP DAAC and optionally imports them as raster_3d hyperspectral cubes, into the current GRASS project or a new one.
+# % description: Downloads NASA EMIT L2A Surface Reflectance or L2B methane/carbon dioxide granules via NASA CMR/LP DAAC and optionally imports them, into the current GRASS project or a new one.
 # % keyword: imagery
 # % keyword: hyperspectral
 # % keyword: EMIT
+# % keyword: methane
+# % keyword: carbon dioxide
+# % keyword: greenhouse gas
 # % keyword: download
 # % keyword: NASA
 # % keyword: CMR
@@ -88,7 +91,37 @@
 
 # %flag
 # % key: i
-# % description: Import downloaded granules with i.hyper.import as raster_3d hyperspectral cubes
+# % description: Import downloaded granules (reflectance with i.hyper.import as raster_3d cubes; gas products as 2D rasters and vector plume outlines)
+# %end
+
+# %flag
+# % key: r
+# % description: Download EMIT L1B at-sensor radiance (RAD) and observation geometry (OBS) instead of surface reflectance
+# % guisection: Radiance
+# %end
+
+# %flag
+# % key: m
+# % description: Download EMIT L2B methane (CH4) products instead of surface reflectance
+# % guisection: Gas
+# %end
+
+# %flag
+# % key: c
+# % description: Download EMIT L2B carbon dioxide (CO2) products instead of surface reflectance
+# % guisection: Gas
+# %end
+
+# %option
+# % key: gas_products
+# % type: string
+# % required: no
+# % multiple: yes
+# % options: enhancement,plumes
+# % answer: enhancement,plumes
+# % description: Gas products to download with -m/-c
+# % descriptions: enhancement;Scene-wide enhancement map with sensitivity and uncertainty layers (ENH);plumes;Detected plume complexes, raster plus GeoJSON outline and attributes (PLM)
+# % guisection: Gas
 # %end
 
 # %option
@@ -129,7 +162,7 @@
 # % type: string
 # % required: no
 # % multiple: no
-# % description: Name for a Space-Time 3D Raster Dataset (str3ds) collecting all imported cubes over time (requires -i)
+# % description: Name for a space-time dataset of imported maps (requires -i): a str3ds of reflectance cubes, or with -m/-c one strds per gas product, suffixed e.g. _ch4enh
 # % guisection: Import
 # %end
 
@@ -164,6 +197,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -175,6 +209,20 @@ import grass.script as gs
 
 CMR_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
 LPDAAC_HOST = "lpdaac.earthdatacloud.nasa.gov"
+
+# EMIT L1B at-sensor radiance collection: each granule is one scene holding a
+# radiance NetCDF (RAD) and an observation geometry NetCDF (OBS).
+L1B_RADIANCE = "EMITL1BRAD"
+
+# EMIT L2B greenhouse gas collections, per gas and per product. Each
+# enhancement (ENH) granule is one scene holding single-band GeoTIFFs for the
+# enhancement, its sensitivity (SENS) and its uncertainty (UNCERT); each plume
+# (PLM) granule is one plume complex: a single-band GeoTIFF plus a GeoJSON
+# outline carrying the plume attributes (PLMMETA).
+GAS_COLLECTIONS = {
+    "ch4": {"enhancement": "EMITL2BCH4ENH", "plumes": "EMITL2BCH4PLM"},
+    "co2": {"enhancement": "EMITL2BCO2ENH", "plumes": "EMITL2BCO2PLM"},
+}
 
 # ---------------------------------------------------------------------------
 # Region / search bounding box (always read from the *calling* session's own
@@ -200,12 +248,15 @@ def get_region_bbox_latlon() -> tuple[float, float, float, float]:
         float(region["ll_n"]),
     )
 
+
 # ---------------------------------------------------------------------------
 # NASA CMR search
 # ---------------------------------------------------------------------------
 
 
-def fetch_granules(short_name, bbox, start, end, clouds=None, page_size=100):
+def fetch_granules(
+    short_name, bbox, start, end, clouds=None, page_size=100, newest_only=True
+):
     """Query NASA CMR for granules of short_name intersecting bbox/date range.
 
     Parameters
@@ -218,6 +269,12 @@ def fetch_granules(short_name, bbox, start, end, clouds=None, page_size=100):
         granule.json response includes a top-level 'cloud_cover' field but
         the search API itself has no cloud-cover query parameter for this
         collection).
+    newest_only : bool
+        Keep only the newest collection version of each acquisition (see
+        latest_versions). Applied before the cloud filter, since versions of
+        one acquisition report different cloud cover and the newest is the
+        reference. Must be False for plume complexes, several of which share
+        one acquisition time.
 
     Returns
     -------
@@ -251,12 +308,87 @@ def fetch_granules(short_name, bbox, start, end, clouds=None, page_size=100):
             break
         time.sleep(0.2)
 
+    if newest_only:
+        before = len(granules)
+        granules = latest_versions(granules)
+        if len(granules) < before:
+            gs.verbose(
+                f"Version filter: {before} -> {len(granules)} granule(s) "
+                f"(older collection versions of the same acquisitions dropped)"
+            )
+
     if clouds is not None:
         before = len(granules)
         granules = [g for g in granules if int(g.get("cloud_cover", 0) or 0) <= clouds]
-        gs.verbose(f"Cloud filter (<= {clouds}%): {before} -> {len(granules)} granule(s)")
+        gs.verbose(
+            f"Cloud filter (<= {clouds}%): {before} -> {len(granules)} granule(s)"
+        )
+
+    granules = _filter_by_true_footprint(granules, bbox)
 
     return granules
+
+
+def _filter_by_true_footprint(granules, bbox):
+    """Drop granules whose actual flight-swath footprint polygon (CMR's own
+    'polygons' field) does not intersect the search bbox.
+
+    CMR's bounding_box= search matches a granule whenever its *rectangular*
+    spatial extent overlaps the query box -- but EMIT is acquired along
+    diagonal ISS flight lines, so the true footprint is a rotated strip
+    within that rectangle. A granule can therefore satisfy the rectangle
+    test while its real swath misses the query area entirely (observed in
+    practice: a granule whose bounding rectangle covered a study area, but
+    whose swath's actual GLT coverage there was 100% fill/no-data). Since
+    CMR already returns each granule's true footprint polygon at no extra
+    request cost, cross-check it here rather than silently trusting the
+    coarser rectangle match.
+    """
+    try:
+        from shapely.geometry import Polygon, box
+    except ImportError:
+        gs.warning(
+            "Python package 'shapely' not found: skipping true-footprint "
+            "cross-check (a granule may pass the coarser CMR bounding-box "
+            "match while its actual diagonal-swath coverage misses the "
+            "search area -- verify results with -p/-l or a GIS before "
+            "committing to a multi-GB download). Install with: pip install shapely"
+        )
+        return granules
+
+    west, south, east, north = bbox
+    aoi_box = box(west, south, east, north)
+    kept = []
+    for g in granules:
+        polys = g.get("polygons")
+        if not polys:
+            kept.append(g)  # no footprint info: fall back to trusting CMR
+            continue
+        try:
+            ring = polys[0][0].split()
+            coords = [
+                (float(ring[i + 1]), float(ring[i])) for i in range(0, len(ring), 2)
+            ]
+            footprint = Polygon(coords)
+            if footprint.intersects(aoi_box):
+                kept.append(g)
+            else:
+                gs.verbose(
+                    f"  [drop] {g.get('title', '?')}: bounding-box match but "
+                    f"true footprint does not intersect the search area"
+                )
+        except Exception as exc:
+            gs.verbose(f"  Could not parse footprint for {g.get('title', '?')}: {exc}")
+            kept.append(g)  # unparseable: fall back to trusting CMR
+
+    dropped = len(granules) - len(kept)
+    if dropped:
+        gs.message(
+            f"True-footprint check: dropped {dropped} granule(s) that matched "
+            f"the search bounding box but whose actual diagonal-swath coverage "
+            f"misses the area (rectangle-vs-polygon false positive)."
+        )
+    return kept
 
 
 def granule_datetime(entry) -> datetime:
@@ -283,6 +415,76 @@ def granule_rfl_url(entry) -> str | None:
             continue
         return href
     return None
+
+
+def granule_gas_urls(entry) -> list[str]:
+    """Return the direct-access HTTPS URLs of every data file (GeoTIFF and
+    GeoJSON) of an EMIT L2B gas granule.
+
+    The browse PNG and the .cmr.json granule record are not "data#" links,
+    so they are left out.
+    """
+    urls = []
+    for link in entry.get("links", []):
+        href = link.get("href", "")
+        if "data#" not in link.get("rel", "") or LPDAAC_HOST not in href:
+            continue
+        if href.endswith((".tif", ".json")) and not href.endswith(".cmr.json"):
+            urls.append(href)
+    return urls
+
+
+def granule_radiance_urls(entry) -> list[str]:
+    """Return the direct-access HTTPS URLs of an EMIT L1B granule's NetCDF
+    files: the at-sensor radiance (RAD) and the observation geometry (OBS,
+    solar and view angles and path length)."""
+    return [
+        link["href"]
+        for link in entry.get("links", [])
+        if "data#" in link.get("rel", "")
+        and LPDAAC_HOST in link.get("href", "")
+        and link["href"].endswith(".nc")
+    ]
+
+
+def latest_versions(granules):
+    """Keep only the newest collection version of each acquisition.
+
+    CMR returns every version of a collection, and EMIT L1B radiance and L2A
+    reflectance are being reprocessed from V001 to V002 (whose granule titles
+    also drop the orbit and scene suffix), so one overpass can match twice;
+    downloading both would fetch the same multi-GB scene twice, and both
+    would get the same timestamp-based map name on import.
+    """
+    newest = {}
+    for g in granules:
+        version = g["title"].split("_")[3]
+        kept = newest.get(g["time_start"])
+        if kept is None or version > kept["title"].split("_")[3]:
+            newest[g["time_start"]] = g
+    return sorted(newest.values(), key=lambda g: g["time_start"])
+
+
+def gas_layer(fname) -> str:
+    """Return the lower-case layer token of an EMIT L2B gas file name, e.g.
+    ch4enh, ch4sens, ch4uncert, ch4plm or ch4plmmeta for
+    EMIT_L2B_CH4SENS_002_<time>_<orbit>_<scene>.tif."""
+    return fname.split("_")[2].lower()
+
+
+def gas_map_name(prefix, fname, acq_time, plume_id=None) -> str:
+    """Build the GRASS map name of one gas file.
+
+    Plume complexes get their plume ID appended, since one overpass can
+    detect several of them; a plume's GeoJSON outline shares the name of its
+    raster (the vector and raster maps are separate element types).
+    """
+    layer = gas_layer(fname).removesuffix("meta")
+    name = f"{prefix}_{layer}_{acq_time.strftime('%Y%m%dT%H%M%S')}"
+    if plume_id:
+        name += f"_{plume_id}"
+    return name
+
 
 # ---------------------------------------------------------------------------
 # Earthdata authentication + download
@@ -331,7 +533,12 @@ def download_file(url, dest: Path) -> bool:
     tmp = dest.with_suffix(dest.suffix + ".part")
     try:
         gs.message(f"  [fetch] {dest.name} …")
-        urllib.request.urlretrieve(url, tmp)
+        with urllib.request.urlopen(url, timeout=120) as r, open(tmp, "wb") as out:
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
         tmp.rename(dest)
         size_mb = dest.stat().st_size / 1e6
         gs.verbose(f"  [fetch] {dest.name}: {size_mb:.1f} MB")
@@ -343,6 +550,7 @@ def download_file(url, dest: Path) -> bool:
     if tmp.exists():
         tmp.unlink()
     return False
+
 
 # ---------------------------------------------------------------------------
 # Target project/mapset (default: the project this module was launched
@@ -376,15 +584,17 @@ def resolve_target_environment(project, dbase, epsg):
     gisrc, env = gs.create_environment(dbase, project, "PERMANENT")
     return env, gisrc
 
+
 # ---------------------------------------------------------------------------
 # Import via i.hyper.import + timestamp + STR3DS
 # ---------------------------------------------------------------------------
 
 
-def import_granule(nc_path, map_name, options, flags, env):
-    """Import one downloaded EMIT RFL granule as a raster_3d cube via
+def import_granule(nc_path, map_name, options, flags, env, extra_flags=""):
+    """Import one downloaded EMIT RFL or RAD granule as a raster_3d cube via
     i.hyper.import, in the target environment (current project or the new
-    one resolved by resolve_target_environment)."""
+    one resolved by resolve_target_environment). extra_flags are added to
+    the i.hyper.import flags."""
     existing = gs.list_grouped("raster_3d", env=env).get(
         gs.gisenv(env=env)["MAPSET"], []
     )
@@ -403,7 +613,7 @@ def import_granule(nc_path, map_name, options, flags, env):
         kwargs["composites"] = options["composites"]
     if options.get("composites_custom"):
         kwargs["composites_custom"] = options["composites_custom"]
-    import_flags = "n" if flags.get("n") else ""
+    import_flags = ("n" if flags.get("n") else "") + extra_flags
 
     gs.message(f"  Importing {map_name} via i.hyper.import…")
     try:
@@ -414,9 +624,97 @@ def import_granule(nc_path, map_name, options, flags, env):
         return False
 
 
-def set_timestamp(map_name, acq_time: datetime, env):
+def hyper_import_can_crop() -> bool:
+    """Return True if the installed i.hyper.import has the -r flag (limit an
+    EMIT import to the current region), which comes with the EMIT reader
+    version that reads L1B radiance."""
+    try:
+        proc = subprocess.run(
+            ["i.hyper.import", "--interface-description"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return '<flag name="r">' in proc.stdout
+
+
+def set_timestamp(map_name, acq_time: datetime, env, module="r3.timestamp"):
     timestamp_str = acq_time.strftime("%d %b %Y %H:%M:%S.%f")[:-3]
-    gs.run_command("r3.timestamp", map=map_name, date=timestamp_str, quiet=True, env=env)
+    gs.run_command(module, map=map_name, date=timestamp_str, quiet=True, env=env)
+
+
+def import_gas_file(path: Path, map_name, crop_to_region, env):
+    """Import one EMIT L2B gas file into the target environment.
+
+    Every gas GeoTIFF holds a single band (enhancement, sensitivity,
+    uncertainty or plume), so it becomes a plain 2D raster map; a plume
+    GeoJSON outline becomes a vector map with the plume attributes.
+
+    Returns the element type imported ("raster" or "vector"), or None if the
+    map was skipped or its import failed.
+    """
+    element = "vector" if path.suffix == ".json" else "raster"
+    mapset = gs.gisenv(env=env)["MAPSET"]
+    existing = gs.list_grouped(element, env=env).get(mapset, [])
+    if map_name in existing and not gs.overwrite():
+        gs.message(
+            "  [skip] <{}> already imported (use --overwrite to redo).".format(map_name)
+        )
+        return None
+
+    gs.message("  Importing <{}>...".format(map_name))
+    try:
+        if element == "raster":
+            # Scene-wide enhancement layers span the whole ~75 km swath, so
+            # they are cropped to the search region; plume rasters are small
+            # and kept whole so that no plume is cut at the region edge.
+            gs.run_command(
+                "r.import",
+                input=str(path),
+                output=map_name,
+                extent="region" if crop_to_region else "input",
+                quiet=True,
+                env=env,
+            )
+            gs.raster_history(map_name, overwrite=True, env=env)
+        else:
+            gs.run_command(
+                "v.import", input=str(path), output=map_name, quiet=True, env=env
+            )
+            gs.vector_history(map_name, replace=True, env=env)
+        return element
+    except Exception as e:
+        gs.warning("  Import failed for <{}>: {}".format(map_name, e))
+        return None
+
+
+def create_strds(strds_name, map_list, title, start, end, env):
+    """Create a Space-Time Raster Dataset (strds) of 2D gas rasters, as
+    create_str3ds() does for reflectance cubes."""
+    gs.message("Creating Space-Time Raster Dataset <{}>...".format(strds_name))
+    gs.run_command(
+        "t.create",
+        type="strds",
+        temporaltype="absolute",
+        output=strds_name,
+        title=title,
+        description=f"Imported by r.in.emit from NASA CMR, {start} to {end}",
+        overwrite=True,
+        quiet=True,
+        env=env,
+    )
+    gs.run_command(
+        "t.register",
+        type="raster",
+        input=strds_name,
+        maps=",".join(map_list),
+        overwrite=True,
+        quiet=True,
+        env=env,
+    )
+    gs.message("STRDS <{}>: {} map(s) registered.".format(strds_name, len(map_list)))
 
 
 def create_str3ds(strds_name, map_list, short_name, start, end, env):
@@ -436,8 +734,7 @@ def create_str3ds(strds_name, map_list, short_name, start, end, env):
         output=strds_name,
         title=f"EMIT {short_name}",
         description=(
-            f"Imported by r.in.emit from NASA CMR ({short_name}), "
-            f"{start} to {end}"
+            f"Imported by r.in.emit from NASA CMR ({short_name}), {start} to {end}"
         ),
         overwrite=True,
         quiet=True,
@@ -453,6 +750,178 @@ def create_str3ds(strds_name, map_list, short_name, start, end, env):
         env=env,
     )
     gs.message(f"STR3DS '{strds_name}': {len(map_list)} cube(s) registered.")
+
+
+def narrow_new_project_region(env, bbox):
+    """Set a brand-new project's region to the search AOI before importing.
+
+    A new project's default region has no useful extent (essentially a
+    1x1-cell placeholder). Narrowing it first lets region-aware importers
+    (i.hyper.import's cropping, r.import extent=region) build only AOI-sized
+    arrays instead of full-granule-sized ones.
+    """
+    west, south, east, north = bbox
+    gs.run_command(
+        "g.region",
+        n=north,
+        s=south,
+        e=east,
+        w=west,
+        res="0:00:03.6",
+        quiet=True,
+        env=env,
+    )
+
+
+def run_products(searches, bbox, output_dir, options, flags):
+    """Search, download and optionally import EMIT L1B radiance and/or L2B
+    gas products.
+
+    searches is a list of (CMR short_name, kind) pairs, kind being
+    "radiance", "enhancement" or "plumes". The cloud filter applies to
+    radiance and enhancement scenes only: a plume complex exists only where
+    the retrieval already found enough clear pixels to detect it, and its
+    CMR cloud cover describes the whole scene, not the plume.
+
+    With -i, each radiance (RAD) file is imported as a raster_3d cube by
+    i.hyper.import -r, cropped to the region; the observation geometry (OBS)
+    file is downloaded only, since no importer reads it.
+    """
+    start, end = options["start"], options["end"]
+    clouds = int(options["clouds"]) if options["clouds"] else None
+    prefix = options["output"]
+    strds_name = options.get("strds") or None
+
+    targets = []  # (short_name, granule entry, acquisition time, plume ID, URLs)
+    for short_name, kind in searches:
+        gs.message(
+            "Querying NASA CMR for {} granules ({} to {})...".format(
+                short_name, start, end
+            )
+        )
+        plumes = kind == "plumes"
+        granules = fetch_granules(
+            short_name,
+            bbox,
+            start,
+            end,
+            None if plumes else clouds,
+            newest_only=not plumes,
+        )
+        gs.message("Found {} {} granule(s).".format(len(granules), short_name))
+        for g in granules:
+            urls = (
+                granule_radiance_urls(g) if kind == "radiance" else granule_gas_urls(g)
+            )
+            if not urls:
+                gs.verbose(f"  Skipping {g.get('title', '?')}: no data link found.")
+                continue
+            plume_id = g["title"].split("_")[-1] if kind == "plumes" else None
+            targets.append((short_name, g, granule_datetime(g), plume_id, urls))
+
+    if not targets:
+        return 0
+
+    if flags["l"]:
+        gs.message("Available granules:")
+        for short_name, g, acq_time, plume_id, urls in targets:
+            cc = g.get("cloud_cover", "n/a")
+            print(
+                f"{acq_time.isoformat()}  {short_name}  cloud_cover={cc}%  "
+                f"{g['title']}  ({len(urls)} files)"
+            )
+        return 0
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    setup_auth(load_token(options.get("token"), output_dir))
+
+    gs.message("Downloading to {}...".format(output_dir))
+    downloaded = []  # (path, map name, acquisition time, crop to region)
+    for short_name, g, acq_time, plume_id, urls in targets:
+        radiance = short_name == L1B_RADIANCE
+        year_dir = output_dir / str(acq_time.year)
+        year_dir.mkdir(exist_ok=True)
+        for url in urls:
+            fname = url.split("/")[-1]
+            dest = year_dir / fname
+            if download_file(url, dest):
+                map_name = gas_map_name(prefix, fname, acq_time, plume_id)
+                if radiance and gas_layer(fname) == "obs":
+                    map_name = None  # Downloaded only: no importer reads OBS.
+                downloaded.append((dest, map_name, acq_time, plume_id is None))
+
+    gs.message(
+        "Downloaded/available: {} file(s) from {} granule(s).".format(
+            len(downloaded), len(targets)
+        )
+    )
+    if not flags["i"]:
+        gs.message("Done (download only). Use -i to also import.")
+        return 0
+
+    env, gisrc = resolve_target_environment(
+        options.get("project") or None,
+        options.get("dbase") or None,
+        int(options.get("epsg") or "4326"),
+    )
+    try:
+        if env is not None:
+            narrow_new_project_region(env, bbox)
+        rasters = {}  # layer (e.g. ch4enh) -> list of imported raster maps
+        cubes = []  # imported L1B radiance raster_3d maps
+        n_vectors = 0
+        for path, map_name, acq_time, crop in downloaded:
+            if map_name is None:
+                gs.verbose(f"  Not imported (no importer): {path.name}")
+                continue
+            if path.suffix == ".nc":
+                # L1B radiance: -r reads only the swath window of the region.
+                if import_granule(path, map_name, options, flags, env, "r"):
+                    set_timestamp(map_name, acq_time, env)
+                    cubes.append(map_name)
+                continue
+            element = import_gas_file(path, map_name, crop, env)
+            if element == "raster":
+                set_timestamp(map_name, acq_time, env, module="r.timestamp")
+                rasters.setdefault(gas_layer(path.name), []).append(map_name)
+            elif element == "vector":
+                set_timestamp(map_name, acq_time, env, module="v.timestamp")
+                n_vectors += 1
+
+        n_rasters = sum(len(v) for v in rasters.values())
+        gs.message(
+            "Imported {} radiance cube(s), {} raster map(s) and {} plume "
+            "outline vector map(s).".format(len(cubes), n_rasters, n_vectors)
+        )
+
+        if env is not None and cubes:
+            gs.run_command(
+                "g.region", raster_3d=cubes[0], flags="ps", quiet=True, env=env
+            )
+        elif env is not None and rasters:
+            first = next(iter(rasters.values()))[0]
+            gs.run_command("g.region", raster=first, flags="ps", quiet=True, env=env)
+
+        if strds_name and cubes:
+            create_str3ds(f"{strds_name}_rad", cubes, L1B_RADIANCE, start, end, env)
+
+        if strds_name and rasters:
+            for layer, maps in rasters.items():
+                create_strds(
+                    f"{strds_name}_{layer}",
+                    maps,
+                    f"EMIT L2B {layer.upper()}",
+                    start,
+                    end,
+                    env,
+                )
+        elif strds_name and not cubes:
+            gs.warning("No maps imported; space-time dataset not created.")
+        return 0
+    finally:
+        if gisrc and os.path.exists(gisrc):
+            os.remove(gisrc)
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -474,14 +943,26 @@ def main():
     do_import = flags["i"]
     strds_name = options.get("strds") or None
     if strds_name and not do_import:
-        gs.fatal("strds= requires -i (imported raster_3d cubes are what get registered).")
+        gs.fatal(
+            "strds= requires -i (imported raster_3d cubes are what get registered)."
+        )
+    if flags["r"] and do_import and not hyper_import_can_crop():
+        # Checked before any download, rather than after fetching several GB.
+        gs.fatal(
+            "-r with -i needs an i.hyper.import whose EMIT reader imports L1B "
+            "radiance and has the -r flag (limit import to the current "
+            "region); the installed one does not. Update i.hyper.import, or "
+            "run without -i to download only."
+        )
 
     project = options.get("project") or None
     dbase = options.get("dbase") or None
     epsg = int(options.get("epsg") or "4326")
 
-    output_dir = Path(output_dir_opt) if output_dir_opt else (
-        Path.home() / "RSDATA" / f"EMIT_{output_prefix}"
+    output_dir = (
+        Path(output_dir_opt)
+        if output_dir_opt
+        else (Path.home() / "RSDATA" / f"EMIT_{output_prefix}")
     )
 
     # --- Search bounding box, always from the calling session's own region
@@ -498,6 +979,22 @@ def main():
             f"short_name={short_name} start={start} end={end}"
         )
         return 0
+
+    # --- L1B radiance (-r) and gas products (-m/-c) replace reflectance ----
+    searches = [(L1B_RADIANCE, "radiance")] if flags["r"] else []
+    for gas, flag in (("ch4", "m"), ("co2", "c")):
+        if flags[flag]:
+            searches += [
+                (GAS_COLLECTIONS[gas][product], product)
+                for product in options["gas_products"].split(",")
+            ]
+    if searches:
+        if short_name != "EMITL2ARFL":
+            gs.warning(
+                "short_name=<{}> is ignored with -r/-m/-c: their own "
+                "collections are searched instead.".format(short_name)
+            )
+        return run_products(searches, bbox, output_dir, options, flags)
 
     # --- Search CMR --------------------------------------------------------
     gs.message(f"Querying NASA CMR for {short_name} granules ({start} to {end})…")
@@ -540,9 +1037,7 @@ def main():
     gs.message(f"Downloaded/available: {len(downloaded)} of {len(targets)} granule(s).")
 
     if not do_import:
-        gs.message(
-            "Done (download only). Use -i to also import via i.hyper.import."
-        )
+        gs.message("Done (download only). Use -i to also import via i.hyper.import.")
         return 0
 
     # --- Target project/mapset for import -----------------------------
@@ -552,6 +1047,10 @@ def main():
     # one then would just leave a pointless empty location behind.
     env, gisrc = resolve_target_environment(project, dbase, epsg)
     try:
+        if env is not None:
+            # EMIT's orthorectified output grid can run several GB per band
+            # subset for a single full scene, hence the AOI-sized region.
+            narrow_new_project_region(env, bbox)
         gs.message("Importing granules via i.hyper.import…")
         imported = []  # (map_name, acq_time)
         for map_name, nc_path, acq_time in downloaded:
