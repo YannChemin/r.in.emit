@@ -249,6 +249,34 @@ def get_region_bbox_latlon() -> tuple[float, float, float, float]:
     )
 
 
+def lon_boxes(bbox):
+    """Split a box that crosses the antimeridian into two.
+
+    g.region -b reports a region that crosses the antimeridian with west
+    greater than east (e.g. west=179.8, east=-178.3 over Fiji).
+    """
+    west, south, east, north = bbox
+    if west <= east:
+        return [bbox]
+    return [(west, south, 180.0, north), (-180.0, south, east, north)]
+
+
+def ring_x(lons, ref):
+    """Continuous ring longitudes, shifted as a whole next to ref.
+
+    Each vertex is unwrapped against the previous one, so a footprint that
+    crosses the antimeridian stays in one piece instead of becoming a band
+    around the globe; the ring is then moved by a whole turn so that its
+    centre lies within 180 degrees of ref.
+    """
+    xs = [lons[0]]
+    for x in lons[1:]:
+        xs.append(x - 360.0 * round((x - xs[-1]) / 360.0))
+    centre = sum(xs) / len(xs)
+    shift = 360.0 * round((ref - centre) / 360.0)
+    return [x + shift for x in xs]
+
+
 # ---------------------------------------------------------------------------
 # NASA CMR search
 # ---------------------------------------------------------------------------
@@ -281,32 +309,37 @@ def fetch_granules(
     list of dict
         Raw CMR granule entries.
     """
-    west, south, east, north = bbox
-    bbox_str = f"{west:.6f},{south:.6f},{east:.6f},{north:.6f}"
-    base_params = (
-        f"short_name={short_name}"
-        f"&bounding_box={bbox_str}"
-        f"&temporal={start}T00:00:00Z,{end}T23:59:59Z"
-        f"&page_size={page_size}"
-        f"&sort_key=start_date"
-    )
-
-    granules = []
-    for page in range(1, 50):
-        url = f"{CMR_URL}?{base_params}&page_num={page}"
-        try:
-            with urllib.request.urlopen(url, timeout=60) as r:
-                data = json.load(r)
-        except Exception as e:
-            gs.fatal(f"NASA CMR search failed: {e}")
-        entries = data.get("feed", {}).get("entry", [])
-        if not entries:
-            break
-        granules.extend(entries)
-        gs.verbose(f"CMR page {page}: {len(entries)} granule(s)")
-        if len(entries) < page_size:
-            break
-        time.sleep(0.2)
+    granules, seen = [], set()
+    # A region across the antimeridian is searched as two boxes.
+    for west, south, east, north in lon_boxes(bbox):
+        bbox_str = f"{west:.6f},{south:.6f},{east:.6f},{north:.6f}"
+        base_params = (
+            f"short_name={short_name}"
+            f"&bounding_box={bbox_str}"
+            f"&temporal={start}T00:00:00Z,{end}T23:59:59Z"
+            f"&page_size={page_size}"
+            f"&sort_key=start_date"
+        )
+        for page in range(1, 50):
+            url = f"{CMR_URL}?{base_params}&page_num={page}"
+            try:
+                with urllib.request.urlopen(url, timeout=60) as r:
+                    data = json.load(r)
+            except Exception as e:
+                gs.fatal(f"NASA CMR search failed: {e}")
+            entries = data.get("feed", {}).get("entry", [])
+            if not entries:
+                break
+            for g in entries:
+                key = g.get("id") or g.get("title")
+                if key not in seen:
+                    seen.add(key)
+                    granules.append(g)
+            gs.verbose(f"CMR page {page}: {len(entries)} granule(s)")
+            if len(entries) < page_size:
+                break
+            time.sleep(0.2)
+    granules.sort(key=lambda g: g.get("time_start", ""))
 
     if newest_only:
         before = len(granules)
@@ -357,7 +390,11 @@ def _filter_by_true_footprint(granules, bbox):
         return granules
 
     west, south, east, north = bbox
+    if east < west:
+        # Across the antimeridian: carry the east edge beyond 180 degrees.
+        east += 360.0
     aoi_box = box(west, south, east, north)
+    centre = (west + east) / 2.0
     kept = []
     for g in granules:
         polys = g.get("polygons")
@@ -366,10 +403,9 @@ def _filter_by_true_footprint(granules, bbox):
             continue
         try:
             ring = polys[0][0].split()
-            coords = [
-                (float(ring[i + 1]), float(ring[i])) for i in range(0, len(ring), 2)
-            ]
-            footprint = Polygon(coords)
+            lats = [float(ring[i]) for i in range(0, len(ring), 2)]
+            lons = ring_x([float(ring[i + 1]) for i in range(0, len(ring), 2)], centre)
+            footprint = Polygon(list(zip(lons, lats)))
             if footprint.intersects(aoi_box):
                 kept.append(g)
             else:
@@ -761,6 +797,9 @@ def narrow_new_project_region(env, bbox):
     arrays instead of full-granule-sized ones.
     """
     west, south, east, north = bbox
+    if east < west:
+        # Across the antimeridian: a geographic region may extend past 180.
+        east += 360.0
     gs.run_command(
         "g.region",
         n=north,

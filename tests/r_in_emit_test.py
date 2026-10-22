@@ -105,3 +105,61 @@ def test_map_names_unique_after_filter(emit, fake_cmr):
     fake_cmr([V1_0403, V2_0403, V1_0617, V2_0617, V1_ONLY])
     stamps = [emit.granule_datetime(g).strftime("%Y%m%dT%H%M%S") for g in fetch(emit)]
     assert len(stamps) == len(set(stamps))
+
+
+# A region across the antimeridian, as g.region -b reports it over Fiji
+# (UTM 60S): west is greater than east.
+FIJI = (179.8, -17.2, -178.3, -16.7)
+
+
+def footprint(title, lonlat):
+    """A granule with a CMR footprint polygon ("lat lon lat lon ...")."""
+    ring = " ".join(f"{lat} {lon}" for lon, lat in lonlat)
+    return granule(title, "2024-06-01T00:00:00.000Z", 0) | {"polygons": [[ring]]}
+
+
+# A swath crossing the antimeridian over Fiji, and one far to the west.
+ACROSS = footprint(
+    "EMIT_L2A_RFL_001_20240601T000000_1",
+    [(179.5, -17.5), (-178.0, -17.5), (-178.0, -16.5), (179.5, -16.5), (179.5, -17.5)],
+)
+WEST = footprint(
+    "EMIT_L2A_RFL_001_20240601T000100_2",
+    [(170.0, -17.5), (171.0, -17.5), (171.0, -16.5), (170.0, -16.5), (170.0, -17.5)],
+)
+
+
+def test_lon_boxes_split_across_antimeridian(emit):
+    assert emit.lon_boxes((4.0, 50.8, 4.1, 50.9)) == [(4.0, 50.8, 4.1, 50.9)]
+    assert emit.lon_boxes(FIJI) == [(179.8, -17.2, 180.0, -16.7), (-180.0, -17.2, -178.3, -16.7)]
+
+
+def test_footprint_across_antimeridian(emit):
+    pytest.importorskip("shapely")
+    kept = emit._filter_by_true_footprint([ACROSS, WEST], FIJI)
+    assert [g["title"] for g in kept] == [ACROSS["title"]]
+    # A region away from 180 degrees must not match a swath that crosses it.
+    kept = emit._filter_by_true_footprint([ACROSS], (10.0, -17.2, 11.0, -16.7))
+    assert kept == []
+
+
+def test_cmr_searched_twice_across_antimeridian(emit, monkeypatch):
+    boxes = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def urlopen(url, timeout=None):
+        boxes.append(url.split("bounding_box=")[1].split("&")[0])
+        return Response(json.dumps({"feed": {"entry": []}}).encode())
+
+    monkeypatch.setattr(emit.urllib.request, "urlopen", urlopen)
+    emit.fetch_granules("EMITL2ARFL", FIJI, "a", "b")
+    assert boxes == [
+        "179.800000,-17.200000,180.000000,-16.700000",
+        "-180.000000,-17.200000,-178.300000,-16.700000",
+    ]
