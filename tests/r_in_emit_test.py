@@ -163,3 +163,34 @@ def test_cmr_searched_twice_across_antimeridian(emit, monkeypatch):
         "179.800000,-17.200000,180.000000,-16.700000",
         "-180.000000,-17.200000,-178.300000,-16.700000",
     ]
+
+
+MUTSAMUDU = (44.29, -12.29, 44.56, -12.02)
+
+
+def new_project_region(emit, tmp_path, epsg, bbox):
+    import grass.script as gs
+
+    gs.create_project(path=tmp_path, name=f"p{epsg}", epsg=epsg)
+    gisrc, env = gs.create_environment(tmp_path, f"p{epsg}", "PERMANENT")
+    try:
+        emit.narrow_new_project_region(env, bbox)
+        return gs.parse_command("g.region", flags="g", env=env)
+    finally:
+        import os
+
+        os.remove(gisrc)
+
+
+def test_new_geographic_project_region(emit, tmp_path):
+    reg = new_project_region(emit, tmp_path, 4326, MUTSAMUDU)
+    assert float(reg["w"]) == pytest.approx(44.29, abs=1e-3)
+    assert float(reg["n"]) == pytest.approx(-12.02, abs=1e-3)
+
+
+def test_new_projected_project_region(emit, tmp_path):
+    # UTM 38S: the region must be in metres around Mutsamudu, not degrees.
+    reg = new_project_region(emit, tmp_path, 32738, MUTSAMUDU)
+    assert 410000 < float(reg["w"]) < float(reg["e"]) < 470000
+    assert 8630000 < float(reg["s"]) < float(reg["n"]) < 8680000
+    assert float(reg["nsres"]) == 60.0

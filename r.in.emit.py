@@ -795,18 +795,69 @@ def narrow_new_project_region(env, bbox):
     1x1-cell placeholder). Narrowing it first lets region-aware importers
     (i.hyper.import's cropping, r.import extent=region) build only AOI-sized
     arrays instead of full-granule-sized ones.
+
+    The AOI is a WGS84 box. In a projected project (epsg= other than a
+    geographic CRS) points along its edges are projected with m.proj, and the
+    region is their bounding box at the 60 m EMIT pixel size.
     """
     west, south, east, north = bbox
     if east < west:
         # Across the antimeridian: a geographic region may extend past 180.
         east += 360.0
+    latlon = gs.parse_command("g.proj", flags="g", env=env).get("proj") in (
+        "ll",
+        "longlat",
+    )
+    if latlon:
+        gs.run_command(
+            "g.region",
+            n=north,
+            s=south,
+            e=east,
+            w=west,
+            res="0:00:03.6",
+            quiet=True,
+            env=env,
+        )
+        return
+    steps = 8
+    edge = []
+    for i in range(steps + 1):
+        lon = west + (east - west) * i / steps
+        lat = south + (north - south) * i / steps
+        edge += [(lon, south), (lon, north), (west, lat), (east, lat)]
+    points = "".join(
+        f"{(lon + 180.0) % 360.0 - 180.0} {lat}\n" for lon, lat in edge
+    )
+    proc = gs.start_command(
+        "m.proj",
+        flags="id",
+        input="-",
+        separator="space",
+        stdin=gs.PIPE,
+        stdout=gs.PIPE,
+        env=env,
+    )
+    # GRASS opens the pipes in text mode on recent versions, bytes on older.
+    text = getattr(proc, "text_mode", False)
+    out = proc.communicate(points if text else points.encode())[0]
+    out = out if text else out.decode()
+    xy = [
+        tuple(map(float, line.split()[:2]))
+        for line in out.splitlines()
+        if line.strip() and "*" not in line
+    ]
+    if proc.returncode or not xy:
+        gs.fatal("Could not project the search area into the new project")
+    xs, ys = [p[0] for p in xy], [p[1] for p in xy]
     gs.run_command(
         "g.region",
-        n=north,
-        s=south,
-        e=east,
-        w=west,
-        res="0:00:03.6",
+        n=max(ys),
+        s=min(ys),
+        e=max(xs),
+        w=min(xs),
+        res=60,
+        flags="a",
         quiet=True,
         env=env,
     )
